@@ -12,7 +12,7 @@ class LinkIn(BaseModel): url:str
 def get_model():
     global model
     if model is None:
-        model=WhisperModel("small",device="cpu",compute_type="int8")
+        model=WhisperModel("tiny",device="cpu",compute_type="int8",cpu_threads=2,num_workers=1)
     return model
 
 def clean_chunks(chunks):
@@ -20,7 +20,7 @@ def clean_chunks(chunks):
     return [c for c in chunks if c["text"] and not bad.match(c["text"])]
 
 def transcribe_path(path):
-    segs,info=get_model().transcribe(str(path),language="pt",vad_filter=True,beam_size=5,condition_on_previous_text=True)
+    segs,info=get_model().transcribe(str(path),language="pt",vad_filter=True,beam_size=1,condition_on_previous_text=False)
     chunks=[]
     for s in segs:
         t=(s.text or "").strip()
