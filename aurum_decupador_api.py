@@ -1,88 +1,93 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import subprocess, tempfile, pathlib, re, html
+from faster_whisper import WhisperModel
+import subprocess, tempfile, pathlib, re, html, os
 
-app = FastAPI(title='Aurum Decupador Link API')
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=['*'],
-    allow_credentials=False,
-    allow_methods=['GET','POST','OPTIONS'],
-    allow_headers=['*'],
-)
+app=FastAPI(title="Aurum Decupador API")
+app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_credentials=False,allow_methods=["*"],allow_headers=["*"])
+model=None
+class LinkIn(BaseModel): url:str
 
-class LinkIn(BaseModel):
-    url: str
+def get_model():
+    global model
+    if model is None:
+        model=WhisperModel("small",device="cpu",compute_type="int8")
+    return model
 
-@app.get('/health')
-def health():
-    return {'ok': True}
+def clean_chunks(chunks):
+    bad=re.compile(r"^\s*[\[(]?(música|music|aplausos|applause|instrumental|som)[\])]?[.!]?\s*$",re.I)
+    return [c for c in chunks if c["text"] and not bad.match(c["text"])]
 
-def parse_vtt(text: str):
+def transcribe_path(path):
+    segs,info=get_model().transcribe(str(path),language="pt",vad_filter=True,beam_size=5,condition_on_previous_text=True)
     chunks=[]
-    current_time=None
-    current=[]
+    for s in segs:
+        t=(s.text or "").strip()
+        if t: chunks.append({"start":round(float(s.start),2),"end":round(float(s.end),2),"text":t})
+    chunks=clean_chunks(chunks)
+    text=" ".join(x["text"] for x in chunks).strip()
+    if len(text.split())<20: raise HTTPException(422,"Não encontrei fala suficiente neste arquivo.")
+    return {"ok":True,"language":"pt","duration":round(float(getattr(info,"duration",0) or 0),2),"chunks":chunks,"text":text}
+
+@app.get("/health")
+def health(): return {"ok":True}
+
+@app.post("/transcribe")
+async def transcribe(file:UploadFile=File(...)):
+    suffix=pathlib.Path(file.filename or "media.mp4").suffix or ".mp4"
+    with tempfile.TemporaryDirectory() as td:
+        p=pathlib.Path(td)/("media"+suffix)
+        with p.open("wb") as f:
+            while True:
+                b=await file.read(1024*1024)
+                if not b: break
+                f.write(b)
+        return transcribe_path(p)
+
+def parse_vtt(text):
+    chunks=[]; cur=None; lines=[]
+    def flush():
+        nonlocal cur,lines
+        if cur and lines:
+            t=re.sub(r"\s+"," ",html.unescape(re.sub(r"<[^>]+>",""," ".join(lines)))).strip()
+            if t: chunks.append({"start":cur[0],"end":cur[1],"text":t})
+        cur=None; lines=[]
     for raw in text.splitlines():
         line=raw.strip()
-        if not line or line.startswith('WEBVTT') or line.startswith('NOTE') or line.startswith('Kind:') or line.startswith('Language:'):
-            if current_time and current:
-                txt=' '.join(current)
-                txt=re.sub(r'<[^>]+>', '', txt)
-                txt=html.unescape(txt)
-                txt=re.sub(r'\s+', ' ', txt).strip()
-                if txt and (not chunks or txt != chunks[-1]['text']):
-                    chunks.append({'start': current_time[0], 'end': current_time[1], 'text': txt})
-            current_time=None; current=[]
-            continue
-        if '-->' in line:
+        if "-->" in line:
+            flush()
             try:
-                a,b=[x.strip().split(' ')[0] for x in line.split('-->')[:2]]
+                a,b=[x.strip().split(" ")[0] for x in line.split("-->")[:2]]
                 def sec(v):
-                    p=v.replace(',','.').split(':')
-                    if len(p)==3: return float(p[0])*3600+float(p[1])*60+float(p[2])
-                    return float(p[0])*60+float(p[1])
-                current_time=(sec(a),sec(b))
-                current=[]
-            except Exception:
-                current_time=None; current=[]
-        elif current_time and not line.isdigit():
-            current.append(line)
-    if current_time and current:
-        txt=' '.join(current)
-        txt=re.sub(r'<[^>]+>', '', txt)
-        txt=html.unescape(txt)
-        txt=re.sub(r'\s+', ' ', txt).strip()
-        if txt and (not chunks or txt != chunks[-1]['text']):
-            chunks.append({'start': current_time[0], 'end': current_time[1], 'text': txt})
-    return chunks
+                    p=v.replace(",",".").split(":")
+                    return float(p[-1])+60*float(p[-2])+(3600*float(p[-3]) if len(p)>2 else 0)
+                cur=(sec(a),sec(b))
+            except: cur=None
+        elif cur and line and not line.isdigit() and not line.startswith(("WEBVTT","NOTE","Kind:","Language:")):
+            lines.append(line)
+    flush()
+    out=[]
+    for c in chunks:
+        if not out or c["text"]!=out[-1]["text"]: out.append(c)
+    return clean_chunks(out)
 
-@app.post('/youtube-transcript')
-def youtube_transcript(body: LinkIn):
+@app.post("/youtube-transcript")
+def youtube_transcript(body:LinkIn):
     url=body.url.strip()
-    if not url.startswith(('https://www.youtube.com/','https://youtube.com/','https://youtu.be/')):
-        raise HTTPException(400,'Link do YouTube inválido.')
+    if not url.startswith(("https://www.youtube.com/","https://youtube.com/","https://youtu.be/")): raise HTTPException(400,"Link do YouTube inválido.")
     with tempfile.TemporaryDirectory() as td:
-        out=str(pathlib.Path(td)/'sub.%(ext)s')
-        cmd=[
-            'yt-dlp','--no-playlist','--skip-download',
-            '--write-subs','--write-auto-subs',
-            '--sub-langs','pt,pt-BR,pt-PT,en',
-            '--sub-format','vtt',
-            '-o',out,url
-        ]
-        p=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
-        files=list(pathlib.Path(td).glob('sub*.vtt'))
-        if not files:
-            detail='Este vídeo não disponibilizou legenda. Envie o arquivo de vídeo/áudio para a análise no navegador.'
-            if p.stderr:
-                low=p.stderr.lower()
-                if 'sign in' in low or 'bot' in low:
-                    detail='O YouTube bloqueou a leitura automática deste link. Envie o arquivo de vídeo/áudio para a análise no navegador.'
-            raise HTTPException(422,detail)
-        preferred=sorted(files,key=lambda x:(0 if '.pt' in x.name else 1,len(x.name)))[0]
-        chunks=parse_vtt(preferred.read_text(encoding='utf-8',errors='ignore'))
-        if not chunks:
-            raise HTTPException(422,'A legenda foi encontrada, mas não pôde ser lida.')
-        duration=max(c['end'] for c in chunks)
-        return {'ok':True,'language':'pt','duration':duration,'chunks':chunks,'text':' '.join(c['text'] for c in chunks)}
+        base=pathlib.Path(td)
+        sub=str(base/"sub.%(ext)s")
+        p=subprocess.run(["yt-dlp","--no-playlist","--skip-download","--write-subs","--write-auto-subs","--sub-langs","pt,pt-BR,pt-PT","--sub-format","vtt","-o",sub,url],capture_output=True,text=True,timeout=120)
+        files=list(base.glob("sub*.vtt"))
+        if files:
+            chunks=parse_vtt(files[0].read_text(encoding="utf-8",errors="ignore"))
+            text=" ".join(x["text"] for x in chunks).strip()
+            if len(text.split())>=20:
+                return {"ok":True,"language":"pt","duration":max(x["end"] for x in chunks),"chunks":chunks,"text":text}
+        out=str(base/"audio.%(ext)s")
+        p=subprocess.run(["yt-dlp","--no-playlist","-f","bestaudio/best","-o",out,url],capture_output=True,text=True,timeout=180)
+        aud=[x for x in base.glob("audio.*") if x.is_file()]
+        if not aud: raise HTTPException(422,"Não consegui obter áudio ou legenda deste vídeo.")
+        return transcribe_path(aud[0])
