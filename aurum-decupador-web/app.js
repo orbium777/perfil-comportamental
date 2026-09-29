@@ -16,7 +16,83 @@ function boxType(u8,o=4){return String.fromCharCode(u8[o],u8[o+1],u8[o+2],u8[o+3
 async function readBox(file,offset){const ab=await file.slice(offset,Math.min(file.size,offset+16)).arrayBuffer();if(ab.byteLength<8)throw new Error("MP4 inválido: cabeçalho incompleto.");const u8=new Uint8Array(ab),dv=new DataView(ab);let size=dv.getUint32(0),header=8;if(size===1){if(ab.byteLength<16)throw new Error("MP4 inválido: caixa estendida incompleta.");size=dv.getUint32(8)*4294967296+dv.getUint32(12);header=16}else if(size===0)size=file.size-offset;if(!Number.isFinite(size)||size<header||offset+size>file.size+1)throw new Error("MP4 inválido: estrutura de arquivo inconsistente.");return{offset,size,header,type:boxType(u8)}}
 function aacFreqIndex(rate){const rates=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];const i=rates.indexOf(Number(rate));if(i<0)throw new Error("Taxa de áudio AAC não suportada: "+rate+" Hz.");return i}
 function adtsHeader(payload,rate,channels,objectType=2){const fi=aacFreqIndex(rate),profile=Math.max(0,Math.min(3,objectType-1)),len=payload+7,ch=Math.max(1,Math.min(7,Number(channels)||2));const h=new Uint8Array(7);h[0]=0xff;h[1]=0xf1;h[2]=(profile<<6)|(fi<<2)|((ch>>2)&1);h[3]=((ch&3)<<6)|((len>>11)&3);h[4]=(len>>3)&255;h[5]=((len&7)<<5)|0x1f;h[6]=0xfc;return h}
-async function extractAudioFromMp4(file){stat("Lendo somente a faixa de áudio do vídeo...");progress(5);let offset=0,ftyp=null,moov=null,steps=0;while(offset<file.size&&steps<10000){const b=await readBox(file,offset);if(b.type==="ftyp")ftyp=b;if(b.type==="moov"){moov=b;break}offset+=b.size;steps++;if(steps%10===0)await new Promise(r=>setTimeout(r,0))}if(!moov)throw new Error("Não encontrei os dados de áudio deste MP4.");if(moov.size>128*1024*1024)throw new Error("Os metadados deste MP4 são grandes demais para leitura no navegador.");const mp4=MP4Box.createFile();const ready=new Promise((resolve,reject)=>{mp4.onReady=info=>resolve(info);mp4.onError=e=>reject(new Error("Não consegui ler a estrutura do MP4: "+e))});if(ftyp){const b=await file.slice(ftyp.offset,ftyp.offset+ftyp.size).arrayBuffer();b.fileStart=ftyp.offset;mp4.appendBuffer(b)}const mb=await file.slice(moov.offset,moov.offset+moov.size).arrayBuffer();mb.fileStart=moov.offset;mp4.appendBuffer(mb);mp4.flush();const info=await ready;const track=(info.audioTracks&&info.audioTracks[0])||info.tracks.find(t=>t.audio);if(!track)throw new Error("Este vídeo não possui faixa de áudio.");if(!/^mp4a\.40\.2/i.test(track.codec||""))throw new Error("O áudio deste MP4 não é AAC-LC. Envie o áudio em MP3/WAV ou use um MP4 com áudio AAC.");const trak=mp4.getTrackById(track.id),samples=(trak&&trak.samples)||[];if(!samples.length)throw new Error("Não consegui localizar as amostras de áudio do MP4.");const rate=track.audio?.sample_rate||track.timescale||48000,channels=track.audio?.channel_count||2;const groups=[];let g=null;for(let i=0;i<samples.length;i++){const s=samples[i],so=Number(s.offset),sz=Number(s.size);if(!Number.isFinite(so)||!Number.isFinite(sz)||sz<=0)continue;if(!g||so!==g.end||(g.end-g.start)+sz>8*1024*1024){g={start:so,end:so+sz,items:[s]};groups.push(g)}else{g.end=so+sz;g.items.push(s)}}if(!groups.length)throw new Error("Não consegui mapear a faixa de áudio deste MP4.");const out=[];for(let gi=0;gi<groups.length;gi++){const gr=groups[gi],ab=await file.slice(gr.start,gr.end).arrayBuffer(),u8=new Uint8Array(ab);const parts=[];for(const s of gr.items){const rel=Number(s.offset)-gr.start,sz=Number(s.size);parts.push(adtsHeader(sz,rate,channels,2));parts.push(u8.subarray(rel,rel+sz))}out.push(new Blob(parts,{type:"audio/aac"}));if(gi%5===0){progress(8+Math.round(27*((gi+1)/groups.length)));stat(`Extraindo apenas o áudio: ${Math.round(100*(gi+1)/groups.length)}%`);await new Promise(r=>setTimeout(r,0))}}const name=(file.name.replace(/\.[^.]+$/,".")||"audio.")+"aac";const audio=new File(out,name,{type:"audio/aac",lastModified:Date.now()});if(audio.size<1024)throw new Error("A faixa de áudio extraída ficou vazia.");stat(`Áudio extraído. Enviando ${(audio.size/1024/1024).toFixed(1)} MB para transcrição...`);return audio}
+
+async function extractAudioFromMp4(file){
+  stat("Localizando a faixa de áudio...");progress(5);
+  let offset=0,ftyp=null,moov=null,steps=0;
+  while(offset<file.size&&steps<10000){
+    const b=await readBox(file,offset);
+    if(b.type==="ftyp")ftyp=b;
+    if(b.type==="moov"){moov=b;break}
+    offset+=b.size;steps++;
+    if(steps%20===0)await new Promise(r=>setTimeout(r,0));
+  }
+  if(!moov)throw new Error("Não encontrei os dados de áudio deste MP4.");
+  if(moov.size>128*1024*1024)throw new Error("Os metadados deste MP4 são grandes demais para leitura rápida.");
+
+  stat("Lendo os metadados do áudio...");progress(7);
+  const ftypBuf=ftyp?await file.slice(ftyp.offset,ftyp.offset+ftyp.size).arrayBuffer():null;
+  const moovBuf=await file.slice(moov.offset,moov.offset+moov.size).arrayBuffer();
+  const totalMeta=(ftypBuf?.byteLength||0)+moovBuf.byteLength;
+  const joined=new Uint8Array(totalMeta);
+  let p=0;
+  if(ftypBuf){joined.set(new Uint8Array(ftypBuf),p);p+=ftypBuf.byteLength}
+  joined.set(new Uint8Array(moovBuf),p);
+  const meta=joined.buffer;meta.fileStart=0;
+
+  const mp4=MP4Box.createFile();
+  const ready=new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error("A leitura dos metadados do MP4 demorou demais.")),15000);
+    mp4.onReady=info=>{clearTimeout(timer);resolve(info)};
+    mp4.onError=e=>{clearTimeout(timer);reject(new Error("Não consegui ler a estrutura do MP4: "+e))};
+  });
+  mp4.appendBuffer(meta);mp4.flush();
+  const info=await ready;
+  const track=(info.audioTracks&&info.audioTracks[0])||info.tracks.find(t=>t.audio);
+  if(!track)throw new Error("Este vídeo não possui faixa de áudio.");
+  if(!/^mp4a\.40\.2/i.test(track.codec||""))throw new Error("O áudio deste MP4 não é AAC-LC. Envie o áudio em MP3/WAV ou use um MP4 com áudio AAC.");
+  const trak=mp4.getTrackById(track.id),samples=(trak&&trak.samples)||[];
+  if(!samples.length)throw new Error("Não consegui localizar as amostras de áudio do MP4.");
+
+  const rate=track.audio?.sample_rate||track.timescale||48000,channels=track.audio?.channel_count||2;
+  const groups=[];let g=null;
+  for(const s of samples){
+    const so=Number(s.offset),sz=Number(s.size);
+    if(!Number.isFinite(so)||!Number.isFinite(sz)||sz<=0)continue;
+    if(!g||so!==g.end||(g.end-g.start)+sz>8*1024*1024){g={start:so,end:so+sz,items:[s]};groups.push(g)}
+    else{g.end=so+sz;g.items.push(s)}
+  }
+  if(!groups.length)throw new Error("Não consegui mapear a faixa de áudio deste MP4.");
+
+  stat(`Extraindo o áudio rapidamente: 0%`);progress(9);
+  const out=new Array(groups.length);let next=0,done=0;
+  async function worker(){
+    while(true){
+      const gi=next++;if(gi>=groups.length)return;
+      const gr=groups[gi];
+      const ab=await file.slice(gr.start,gr.end).arrayBuffer(),u8=new Uint8Array(ab);
+      let packedSize=0;for(const s of gr.items)packedSize+=7+Number(s.size);
+      const packed=new Uint8Array(packedSize);let pos=0;
+      for(const s of gr.items){
+        const rel=Number(s.offset)-gr.start,sz=Number(s.size),h=adtsHeader(sz,rate,channels,2);
+        packed.set(h,pos);pos+=7;packed.set(u8.subarray(rel,rel+sz),pos);pos+=sz;
+      }
+      out[gi]=packed;
+      done++;
+      if(done===1||done%25===0||done===groups.length){
+        const pct=Math.round(100*done/groups.length);stat(`Extraindo apenas o áudio: ${pct}%`);progress(9+Math.round(25*done/groups.length));
+        await new Promise(r=>setTimeout(r,0));
+      }
+    }
+  }
+  const workers=Math.min(8,Math.max(2,navigator.hardwareConcurrency?Math.floor(navigator.hardwareConcurrency/2):4));
+  await Promise.all(Array.from({length:workers},()=>worker()));
+  const name=(file.name.replace(/\.[^.]+$/,".")||"audio.")+"aac";
+  const audio=new File(out,name,{type:"audio/aac",lastModified:Date.now()});
+  if(audio.size<1024)throw new Error("A faixa de áudio extraída ficou vazia.");
+  stat(`Áudio extraído em ${(audio.size/1024/1024).toFixed(1)} MB. Preparando transcrição...`);progress(35);
+  return audio;
+}
 async function prepareForUpload(file){const isVideo=(file.type||"").startsWith("video/")||/\.(mp4|m4v|mov)$/i.test(file.name);if(isVideo)return extractAudioFromMp4(file);return file}
 
 async function uploadAndTranscribe(file){await wakeServer();const CHUNK=4*1024*1024,total=Math.ceil(file.size/CHUNK);stat(`Enviando somente o áudio em ${total} partes...`);progress(38);let r=await fetch(API+"/upload/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:file.name,size:file.size,chunks:total})}),start=await readJson(r);if(!r.ok)throw new Error(start.detail||"Não foi possível iniciar o envio.");const id=start.job_id;for(let i=0;i<total;i++){const blob=file.slice(i*CHUNK,Math.min(file.size,(i+1)*CHUNK));let sent=false,lastErr;for(let attempt=0;attempt<4&&!sent;attempt++){try{stat(`Enviando áudio: parte ${i+1} de ${total}...`);const rr=await fetch(`${API}/upload/chunk/${id}/${i}`,{method:"POST",body:blob});if(!rr.ok){const b=await readJson(rr);throw new Error(b.detail||`Falha na parte ${i+1}.`)}sent=true}catch(e){lastErr=e;if(attempt<3){await wakeServer();await new Promise(r=>setTimeout(r,1200))}}}if(!sent)throw lastErr||new Error(`Não foi possível enviar a parte ${i+1}.`);progress(38+20*((i+1)/total))}stat("Áudio recebido. Iniciando transcrição da fala...");r=await fetch(API+`/upload/finish/${id}`,{method:"POST"});const fin=await readJson(r);if(!r.ok)throw new Error(fin.detail||"Não foi possível iniciar a transcrição.");const started=Date.now();while(true){await new Promise(r=>setTimeout(r,4000));let jr;try{jr=await fetch(API+`/job/${id}?x=${Date.now()}`,{cache:"no-store"})}catch(e){await wakeServer();continue}const j=await readJson(jr);if(!jr.ok)throw new Error(j.detail||"Falha ao consultar a transcrição.");if(j.status==="done"){progress(86);return j.result}if(j.status==="error")throw new Error(j.message||"Falha na transcrição.");stat(j.message||"Transcrevendo a fala do vídeo...");const mins=(Date.now()-started)/60000;progress(Math.min(84,60+mins*3));if(Date.now()-started>45*60000)throw new Error("A transcrição ultrapassou 45 minutos.")}}
