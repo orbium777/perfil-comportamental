@@ -10,93 +10,151 @@ function progress(v){$("#progressWrap").classList.remove("hidden");$("#progressB
 function esc(v){return String(v??"").replace(/[&<>\"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}[x]))}
 function time(s){s=Math.max(0,Number(s||0));let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=Math.floor(s%60);return h?`${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}`:`${m}:${String(x).padStart(2,"0")}`}
 async function readJson(r){try{return await r.json()}catch(e){return{}}}
-async function wakeServer(){stat("Preparando o motor de transcrição...");progress(3);for(let i=0;i<24;i++){try{const ctl=new AbortController();const t=setTimeout(()=>ctl.abort(),7000);const r=await fetch(API+"/health?x="+Date.now(),{cache:"no-store",signal:ctl.signal});clearTimeout(t);if(r.ok)return true}catch(e){}stat("Iniciando o motor de transcrição... "+Math.min(120,(i+1)*5)+"s");await new Promise(r=>setTimeout(r,5000))}throw new Error("O motor de transcrição não iniciou.")}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+async function wakeServer(){
+  stat("Preparando o motor de transcrição...");progress(3);
+  for(let i=0;i<24;i++){
+    try{
+      const ctl=new AbortController(),t=setTimeout(()=>ctl.abort(),7000);
+      const r=await fetch(API+"/health?x="+Date.now(),{cache:"no-store",signal:ctl.signal});
+      clearTimeout(t);if(r.ok)return true;
+    }catch(e){}
+    stat("Iniciando o motor de transcrição... "+Math.min(120,(i+1)*5)+"s");
+    await sleep(5000);
+  }
+  throw new Error("O motor de transcrição não iniciou.");
+}
 
 function boxType(u8,o=4){return String.fromCharCode(u8[o],u8[o+1],u8[o+2],u8[o+3])}
-async function readBox(file,offset){const ab=await file.slice(offset,Math.min(file.size,offset+16)).arrayBuffer();if(ab.byteLength<8)throw new Error("MP4 inválido: cabeçalho incompleto.");const u8=new Uint8Array(ab),dv=new DataView(ab);let size=dv.getUint32(0),header=8;if(size===1){if(ab.byteLength<16)throw new Error("MP4 inválido: caixa estendida incompleta.");size=dv.getUint32(8)*4294967296+dv.getUint32(12);header=16}else if(size===0)size=file.size-offset;if(!Number.isFinite(size)||size<header||offset+size>file.size+1)throw new Error("MP4 inválido: estrutura de arquivo inconsistente.");return{offset,size,header,type:boxType(u8)}}
+async function readBox(file,offset){
+  const ab=await file.slice(offset,Math.min(file.size,offset+16)).arrayBuffer();
+  if(ab.byteLength<8)throw new Error("MP4 inválido: cabeçalho incompleto.");
+  const u8=new Uint8Array(ab),dv=new DataView(ab);let size=dv.getUint32(0),header=8;
+  if(size===1){if(ab.byteLength<16)throw new Error("MP4 inválido: caixa estendida incompleta.");size=dv.getUint32(8)*4294967296+dv.getUint32(12);header=16}else if(size===0)size=file.size-offset;
+  if(!Number.isFinite(size)||size<header||offset+size>file.size+1)throw new Error("MP4 inválido: estrutura de arquivo inconsistente.");
+  return{offset,size,header,type:boxType(u8)};
+}
 function aacFreqIndex(rate){const rates=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];const i=rates.indexOf(Number(rate));if(i<0)throw new Error("Taxa de áudio AAC não suportada: "+rate+" Hz.");return i}
 function adtsHeader(payload,rate,channels,objectType=2){const fi=aacFreqIndex(rate),profile=Math.max(0,Math.min(3,objectType-1)),len=payload+7,ch=Math.max(1,Math.min(7,Number(channels)||2));const h=new Uint8Array(7);h[0]=0xff;h[1]=0xf1;h[2]=(profile<<6)|(fi<<2)|((ch>>2)&1);h[3]=((ch&3)<<6)|((len>>11)&3);h[4]=(len>>3)&255;h[5]=((len&7)<<5)|0x1f;h[6]=0xfc;return h}
 
-async function extractAudioFromMp4(file){
-  stat("Localizando a faixa de áudio...");progress(5);
+async function getAudioTrack(file){
+  stat("Lendo a estrutura do vídeo...");progress(5);
   let offset=0,ftyp=null,moov=null,steps=0;
   while(offset<file.size&&steps<10000){
     const b=await readBox(file,offset);
     if(b.type==="ftyp")ftyp=b;
     if(b.type==="moov"){moov=b;break}
     offset+=b.size;steps++;
-    if(steps%20===0)await new Promise(r=>setTimeout(r,0));
+    if(steps%20===0)await sleep(0);
   }
-  if(!moov)throw new Error("Não encontrei os dados de áudio deste MP4.");
-  if(moov.size>128*1024*1024)throw new Error("Os metadados deste MP4 são grandes demais para leitura rápida.");
-
-  stat("Lendo os metadados do áudio...");progress(7);
-  const ftypBuf=ftyp?await file.slice(ftyp.offset,ftyp.offset+ftyp.size).arrayBuffer():null;
-  const moovBuf=await file.slice(moov.offset,moov.offset+moov.size).arrayBuffer();
-  const totalMeta=(ftypBuf?.byteLength||0)+moovBuf.byteLength;
-  const joined=new Uint8Array(totalMeta);
-  let p=0;
-  if(ftypBuf){joined.set(new Uint8Array(ftypBuf),p);p+=ftypBuf.byteLength}
-  joined.set(new Uint8Array(moovBuf),p);
-  const meta=joined.buffer;meta.fileStart=0;
+  if(!moov)throw new Error("Não encontrei os metadados deste MP4.");
+  if(moov.size>128*1024*1024)throw new Error("Os metadados deste MP4 são grandes demais.");
 
   const mp4=MP4Box.createFile();
   const ready=new Promise((resolve,reject)=>{
-    const timer=setTimeout(()=>reject(new Error("A leitura dos metadados do MP4 demorou demais.")),15000);
+    const timer=setTimeout(()=>reject(new Error("A leitura do MP4 demorou demais.")),15000);
     mp4.onReady=info=>{clearTimeout(timer);resolve(info)};
-    mp4.onError=e=>{clearTimeout(timer);reject(new Error("Não consegui ler a estrutura do MP4: "+e))};
+    mp4.onError=e=>{clearTimeout(timer);reject(new Error("Não consegui ler o MP4: "+e))};
   });
-  mp4.appendBuffer(meta);mp4.flush();
+  if(ftyp){const b=await file.slice(ftyp.offset,ftyp.offset+ftyp.size).arrayBuffer();b.fileStart=ftyp.offset;mp4.appendBuffer(b)}
+  const m=await file.slice(moov.offset,moov.offset+moov.size).arrayBuffer();m.fileStart=moov.offset;mp4.appendBuffer(m);mp4.flush();
   const info=await ready;
   const track=(info.audioTracks&&info.audioTracks[0])||info.tracks.find(t=>t.audio);
   if(!track)throw new Error("Este vídeo não possui faixa de áudio.");
-  if(!/^mp4a\.40\.2/i.test(track.codec||""))throw new Error("O áudio deste MP4 não é AAC-LC. Envie o áudio em MP3/WAV ou use um MP4 com áudio AAC.");
+  if(!/^mp4a\.40\.2/i.test(track.codec||""))throw new Error("O áudio deste MP4 não é AAC-LC. Envie o áudio em MP3/WAV ou use MP4 com áudio AAC.");
   const trak=mp4.getTrackById(track.id),samples=(trak&&trak.samples)||[];
-  if(!samples.length)throw new Error("Não consegui localizar as amostras de áudio do MP4.");
+  if(!samples.length)throw new Error("Não consegui localizar as amostras de áudio do vídeo.");
+  const timescale=Number(track.timescale||trak?.timescale||48000);
+  const rate=Number(track.audio?.sample_rate||48000),channels=Number(track.audio?.channel_count||2);
+  return{samples,timescale,rate,channels,duration:Number(track.duration||0)/timescale};
+}
 
-  const rate=track.audio?.sample_rate||track.timescale||48000,channels=track.audio?.channel_count||2;
-  const groups=[];let g=null;
-  for(const s of samples){
-    const so=Number(s.offset),sz=Number(s.size);
-    if(!Number.isFinite(so)||!Number.isFinite(sz)||sz<=0)continue;
-    if(!g||so!==g.end||(g.end-g.start)+sz>8*1024*1024){g={start:so,end:so+sz,items:[s]};groups.push(g)}
-    else{g.end=so+sz;g.items.push(s)}
+function splitAudioSamples(samples,timescale,seconds=180){
+  const valid=samples.filter(s=>Number.isFinite(Number(s.offset))&&Number(s.size)>0);
+  if(!valid.length)return[];
+  const out=[];let current=[],start=Number(valid[0].dts||0)/timescale;
+  for(const s of valid){
+    const t=Number(s.dts||0)/timescale;
+    if(current.length&&t-start>=seconds){out.push({startSec:start,samples:current});current=[];start=t}
+    current.push(s);
   }
-  if(!groups.length)throw new Error("Não consegui mapear a faixa de áudio deste MP4.");
+  if(current.length)out.push({startSec:start,samples:current});
+  return out;
+}
 
-  stat(`Extraindo o áudio rapidamente: 0%`);progress(9);
-  const out=new Array(groups.length);let next=0,done=0;
-  async function worker(){
-    while(true){
-      const gi=next++;if(gi>=groups.length)return;
-      const gr=groups[gi];
-      const ab=await file.slice(gr.start,gr.end).arrayBuffer(),u8=new Uint8Array(ab);
-      let packedSize=0;for(const s of gr.items)packedSize+=7+Number(s.size);
-      const packed=new Uint8Array(packedSize);let pos=0;
-      for(const s of gr.items){
-        const rel=Number(s.offset)-gr.start,sz=Number(s.size),h=adtsHeader(sz,rate,channels,2);
-        packed.set(h,pos);pos+=7;packed.set(u8.subarray(rel,rel+sz),pos);pos+=sz;
-      }
-      out[gi]=packed;
-      done++;
-      if(done===1||done%25===0||done===groups.length){
-        const pct=Math.round(100*done/groups.length);stat(`Extraindo apenas o áudio: ${pct}%`);progress(9+Math.round(25*done/groups.length));
-        await new Promise(r=>setTimeout(r,0));
-      }
+async function buildAacSegment(file,segment,rate,channels,index,total){
+  stat(`Extraindo áudio do trecho ${index+1} de ${total}...`);
+  const MAX_GAP=512*1024,MAX_SPAN=24*1024*1024;
+  const ranges=[];let g=null;
+  for(const s of segment.samples){
+    const so=Number(s.offset),sz=Number(s.size),end=so+sz;
+    if(!g||so-g.end>MAX_GAP||end-g.start>MAX_SPAN){g={start:so,end,items:[]};ranges.push(g)}else g.end=Math.max(g.end,end);
+    g.items.push(s);
+  }
+  let next=0;const buffers=new Array(ranges.length);
+  async function worker(){while(true){const i=next++;if(i>=ranges.length)return;buffers[i]=new Uint8Array(await file.slice(ranges[i].start,ranges[i].end).arrayBuffer())}}
+  const workers=Math.min(6,Math.max(2,Math.floor((navigator.hardwareConcurrency||4)/2)));
+  await Promise.all(Array.from({length:workers},()=>worker()));
+  let totalBytes=0;for(const s of segment.samples)totalBytes+=7+Number(s.size);
+  const packed=new Uint8Array(totalBytes);let pos=0,ri=0;
+  for(const s of segment.samples){
+    const so=Number(s.offset),sz=Number(s.size);
+    while(ri<ranges.length-1&&so>=ranges[ri].end)ri++;
+    const gr=ranges[ri],u8=buffers[ri],rel=so-gr.start,h=adtsHeader(sz,rate,channels,2);
+    packed.set(h,pos);pos+=7;packed.set(u8.subarray(rel,rel+sz),pos);pos+=sz;
+  }
+  return new File([packed],`trecho-${String(index+1).padStart(2,"0")}.aac`,{type:"audio/aac"});
+}
+
+async function transcribeAudioPart(file,index,total,offsetSec){
+  for(let attempt=0;attempt<3;attempt++){
+    try{
+      stat(`Transcrevendo trecho ${index+1} de ${total}...`);
+      const fd=new FormData();fd.append("file",file,file.name);
+      const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),6*60*1000);
+      const r=await fetch(API+"/transcribe",{method:"POST",body:fd,signal:ctl.signal});clearTimeout(timer);
+      const body=await readJson(r);
+      if(r.status===422)return{chunks:[],text:""};
+      if(!r.ok)throw new Error(body.detail||`Falha ao transcrever o trecho ${index+1}.`);
+      const chunks=(body.chunks||[]).map(c=>({start:Number(c.start||0)+offsetSec,end:Number(c.end||0)+offsetSec,text:c.text||""}));
+      return{chunks,text:chunks.map(c=>c.text).join(" ")};
+    }catch(e){
+      if(attempt===2)throw e;
+      stat(`Reconectando o trecho ${index+1}...`);
+      await wakeServer();await sleep(1000);
     }
   }
-  const workers=Math.min(8,Math.max(2,navigator.hardwareConcurrency?Math.floor(navigator.hardwareConcurrency/2):4));
-  await Promise.all(Array.from({length:workers},()=>worker()));
-  const name=(file.name.replace(/\.[^.]+$/,".")||"audio.")+"aac";
-  const audio=new File(out,name,{type:"audio/aac",lastModified:Date.now()});
-  if(audio.size<1024)throw new Error("A faixa de áudio extraída ficou vazia.");
-  stat(`Áudio extraído em ${(audio.size/1024/1024).toFixed(1)} MB. Preparando transcrição...`);progress(35);
-  return audio;
 }
-async function prepareForUpload(file){const isVideo=(file.type||"").startsWith("video/")||/\.(mp4|m4v|mov)$/i.test(file.name);if(isVideo)return extractAudioFromMp4(file);return file}
 
-async function uploadAndTranscribe(file){await wakeServer();const CHUNK=4*1024*1024,total=Math.ceil(file.size/CHUNK);stat(`Enviando somente o áudio em ${total} partes...`);progress(38);let r=await fetch(API+"/upload/start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({filename:file.name,size:file.size,chunks:total})}),start=await readJson(r);if(!r.ok)throw new Error(start.detail||"Não foi possível iniciar o envio.");const id=start.job_id;for(let i=0;i<total;i++){const blob=file.slice(i*CHUNK,Math.min(file.size,(i+1)*CHUNK));let sent=false,lastErr;for(let attempt=0;attempt<4&&!sent;attempt++){try{stat(`Enviando áudio: parte ${i+1} de ${total}...`);const rr=await fetch(`${API}/upload/chunk/${id}/${i}`,{method:"POST",body:blob});if(!rr.ok){const b=await readJson(rr);throw new Error(b.detail||`Falha na parte ${i+1}.`)}sent=true}catch(e){lastErr=e;if(attempt<3){await wakeServer();await new Promise(r=>setTimeout(r,1200))}}}if(!sent)throw lastErr||new Error(`Não foi possível enviar a parte ${i+1}.`);progress(38+20*((i+1)/total))}stat("Áudio recebido. Iniciando transcrição da fala...");r=await fetch(API+`/upload/finish/${id}`,{method:"POST"});const fin=await readJson(r);if(!r.ok)throw new Error(fin.detail||"Não foi possível iniciar a transcrição.");const started=Date.now();while(true){await new Promise(r=>setTimeout(r,4000));let jr;try{jr=await fetch(API+`/job/${id}?x=${Date.now()}`,{cache:"no-store"})}catch(e){await wakeServer();continue}const j=await readJson(jr);if(!jr.ok)throw new Error(j.detail||"Falha ao consultar a transcrição.");if(j.status==="done"){progress(86);return j.result}if(j.status==="error")throw new Error(j.message||"Falha na transcrição.");stat(j.message||"Transcrevendo a fala do vídeo...");const mins=(Date.now()-started)/60000;progress(Math.min(84,60+mins*3));if(Date.now()-started>45*60000)throw new Error("A transcrição ultrapassou 45 minutos.")}}
-async function transcribeFile(file){const prepared=await prepareForUpload(file);return uploadAndTranscribe(prepared)}
+async function transcribeVideo(file){
+  const meta=await getAudioTrack(file);
+  const segments=splitAudioSamples(meta.samples,meta.timescale,180);
+  if(!segments.length)throw new Error("Não encontrei áudio utilizável neste vídeo.");
+  await wakeServer();
+  const all=[];let textParts=[];
+  for(let i=0;i<segments.length;i++){
+    progress(8+Math.round(76*i/segments.length));
+    const audio=await buildAacSegment(file,segments[i],meta.rate,meta.channels,i,segments.length);
+    const part=await transcribeAudioPart(audio,i,segments.length,segments[i].startSec);
+    all.push(...part.chunks);if(part.text)textParts.push(part.text);
+    progress(8+Math.round(76*(i+1)/segments.length));
+    await sleep(0);
+  }
+  const text=textParts.join(" ").replace(/\s+/g," ").trim();
+  if(text.split(/\s+/).length<20)throw new Error("Não encontrei fala suficiente neste vídeo.");
+  return{ok:true,language:"pt",duration:meta.duration||Math.max(0,...all.map(c=>c.end)),chunks:all,text};
+}
+
+async function transcribeFile(file){
+  const isVideo=(file.type||"").startsWith("video/")||/\.(mp4|m4v|mov)$/i.test(file.name);
+  if(isVideo)return transcribeVideo(file);
+  await wakeServer();
+  const part=await transcribeAudioPart(file,0,1,0);
+  if(!part.chunks.length)throw new Error("Não encontrei fala suficiente neste áudio.");
+  return{ok:true,language:"pt",duration:Math.max(0,...part.chunks.map(c=>c.end)),chunks:part.chunks,text:part.text};
+}
+
 async function transcribeYoutube(){const url=$("#youtubeUrl").value.trim();if(!url)throw new Error("Cole o link do YouTube.");if(!$("#rights").checked)throw new Error("Confirme que tem autorização para processar o conteúdo.");await wakeServer();stat("Lendo a legenda disponível do vídeo...");progress(30);const r=await fetch(API+"/youtube-transcript",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});const body=await readJson(r);if(!r.ok)throw new Error(body.detail||"Não foi possível ler este vídeo.");progress(82);return body}
 
 const stop=new Set("a o os as um uma uns umas de da do das dos em no na nos nas e é que para por com sem se ao aos à às como mais menos muito muita muitos muitas eu você vocês ele ela eles elas me te isso isto já não sim foi era ser ter tem tinha vai vou só também aí então porque quando onde quem qual quais meu minha seu sua nosso nossa gente pra pro".split(" "));const emotion=new Set("chorei chorar medo dor milagre cura curado curada perdi perder morreu morte família filho filha mãe pai deus fé esperança sonho sofrimento difícil impossível vitória venceu superou salvou doença câncer hospital médico emocionante agradeço".split(" "));const impact=new Set("nunca sempre ninguém todos verdade segredo erro maior melhor pior mudou transformou descobri aconteceu surpresa inacreditável absurdo atenção importante precisa deve pare".split(" "));const teach=new Set("aprendi ensinar ensino dica passo fazer como forma maneira estratégia resultado funciona explicar explico primeiro segundo terceiro exemplo regra erro".split(" "));
