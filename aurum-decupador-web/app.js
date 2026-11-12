@@ -1,5 +1,5 @@
 const API="https://aurum-decupador-engine.onrender.com";
-let mode="file",lastText="",lastAnalysis=null,engineReady=false,lastTranscript=null,lastSpeechMatches=[];
+let mode="file",lastText="",lastAnalysis=null,engineReady=false,lastTranscript=null,lastSpeechMatches=[],lastVideos=[];
 const $=s=>document.querySelector(s);
 
 function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
@@ -272,8 +272,8 @@ async function transcribeFile(file){
   return{ok:true,language:"pt",duration:Math.max(0,...part.chunks.map(c=>c.end)),chunks:part.chunks,text:part.text};
 }
 
-async function transcribeYoutube(){
-  const url=$("#youtubeUrl").value.trim();if(!url)throw new Error("Cole o link do YouTube.");
+async function transcribeYoutube(url){
+  url=String(url||"").trim();if(!url)throw new Error("Cole o link do YouTube.");
   if(!$("#rights").checked)throw new Error("Confirme que tem autorização para processar este conteúdo.");
   await ensureEngine();stat("Lendo a legenda disponível do vídeo...");progress(30);
   const r=await fetch(API+"/youtube-transcript",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url})});
@@ -327,7 +327,7 @@ function analyze(data){
 
 function title(t){const s=t.split(/[.!?]/)[0].trim().split(/\s+/).slice(0,12).join(" ");return s+(t.split(/\s+/).length>12?"...":"")}
 function render(a,data){
-  lastTranscript=data;lastSpeechMatches=[];$("#speechMatches").textContent="Digite um termo ou escolha uma busca rápida.";$("#speechExport").classList.add("hidden");
+  lastVideos=[{name:"Vídeo 1",url:mode==="youtube"?$("#youtubeUrl").value.trim():"",data}];lastTranscript=data;lastSpeechMatches=[];$("#speechMatches").textContent="Digite um termo ou escolha uma busca rápida.";$("#speechExport").classList.add("hidden");
   $("#summary").textContent=a.summary;
   $("#subjects").innerHTML=a.subjects.map(s=>`<span class="chip">${esc(s)}</span>`).join("");
   $("#cutsTitle").textContent=`${a.cuts.length} cortes encontrados`;
@@ -340,24 +340,83 @@ function render(a,data){
 $("#copyAll").onclick=async()=>{await navigator.clipboard.writeText(lastText);stat("Lista copiada.")};
 $("#exportExcel").onclick=()=>{
   if(!lastAnalysis||!lastAnalysis.cuts?.length){stat("Faça uma análise antes de exportar.",true);return}
-  const rows=[["Nº","Assunto","Categoria","Início","Fim","Duração (s)","Pontuação","Título","Trecho transcrito"]];
-  lastAnalysis.cuts.forEach((c,i)=>rows.push([i+1,c.subject,c.category,time(c.start),time(c.end),Math.round(c.duration),c.score,title(c.text),c.text]));
+  const rows=[["Nº","Vídeo","Assunto","Categoria","Início","Fim","Duração (s)","Pontuação","Título","Trecho transcrito"]];
+  lastAnalysis.cuts.forEach((c,i)=>rows.push([i+1,c.sourceName||"Vídeo 1",c.subject,c.category,time(c.start),time(c.end),Math.round(c.duration),c.score,title(c.text),c.text]));
   const xml='<?xml version="1.0"?><?mso-application progid="Excel.Sheet"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="Decupagem"><Table>'+rows.map(r=>"<Row>"+r.map(v=>"<Cell><Data ss:Type=\""+(typeof v==="number"?"Number":"String")+"\">"+esc(v)+"</Data></Cell>").join("")+"</Row>").join("")+"</Table></Worksheet></Workbook>";
   const blob=new Blob(["\ufeff",xml],{type:"application/vnd.ms-excel"}),url=URL.createObjectURL(blob),a=document.createElement("a");
   a.href=url;a.download="aurum-decupagem-"+new Date().toISOString().slice(0,10)+".xls";document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);stat("Excel exportado.");
 };
 
+function selectedSources(){
+  if(mode==="file"){
+    const files=Array.from($("#fileInput").files||[]);
+    if(!files.length)throw new Error("Selecione pelo menos um arquivo.");
+    if(files.length>5)throw new Error("O limite é de 5 arquivos por análise.");
+    return files.map((file,i)=>({name:file.name||"Arquivo "+(i+1),file,url:""}));
+  }
+  if(!$("#rights").checked)throw new Error("Confirme a autorização para processar os vídeos.");
+  const urls=$("#youtubeUrl").value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+  if(!urls.length)throw new Error("Informe pelo menos um link do YouTube.");
+  if(urls.length>5)throw new Error("O limite é de 5 links por análise.");
+  for(const url of urls){
+    let u;try{u=new URL(url)}catch{throw new Error("Link inválido: "+url)}
+    if(!["youtube.com","www.youtube.com","youtu.be","m.youtube.com"].includes(u.hostname))throw new Error("Use apenas links do YouTube: "+url);
+  }
+  return urls.map((url,i)=>({name:"YouTube "+(i+1),url,file:null}));
+}
+function renderBatch(videos,errors){
+  lastVideos=videos;lastTranscript=videos[0]?.data||null;lastSpeechMatches=[];
+  const allCuts=[],subjects=new Set(),transcripts=[];
+  for(let i=0;i<videos.length;i++){
+    const v=videos[i],sourceName=v.name;
+    transcripts.push("=== "+sourceName+" ===\n"+(v.data.text||""));
+    try{
+      const a=analyze(v.data);
+      for(const c of a.cuts){allCuts.push({...c,sourceName,sourceIndex:i,url:v.url||""});subjects.add(c.subject)}
+    }catch(e){v.cutWarning=e.message||"Nenhum corte automático selecionado."}
+  }
+  const objective=$("#analysisObjective").value.trim();
+  lastAnalysis={cuts:allCuts,subjects:[...subjects],groups:{},summary:""};
+  lastText=allCuts.map((c,i)=>(i+1)+". "+c.sourceName+" | "+c.subject+" | "+time(c.start)+" → "+time(c.end)+" | "+title(c.text)).join("\n");
+  $("#summary").textContent=videos.length+" vídeo(s) transcrito(s), "+allCuts.length+" corte(s) automático(s)."+(objective?" Objetivo: "+objective+".":"")+(errors.length?" "+errors.length+" material(is) com erro.":"");
+  $("#subjects").innerHTML=[...subjects].map(s=>'<span class="chip">'+esc(s)+'</span>').join("");
+  $("#cutsTitle").textContent=allCuts.length+" cortes encontrados";
+  $("#transcriptText").textContent=transcripts.join("\n\n");
+  $("#groups").innerHTML=videos.map((v,i)=>{
+    const cuts=allCuts.filter(c=>c.sourceIndex===i);
+    return '<section class="subjectGroup"><div class="subjectTitle"><h3>'+esc(v.name)+'</h3><span class="subjectCount">'+cuts.length+' cortes</span></div>'+
+      (cuts.length?'<div class="cuts">'+cuts.map(c=>'<article class="cut"><div class="eyebrow">'+esc(c.subject)+'</div><h4>'+esc(title(c.text))+'</h4><div class="timecode">'+time(c.start)+' → '+time(c.end)+'</div><div class="context">'+esc(c.text)+'</div></article>').join("")+'</div>':'<p class="muted">Não foram selecionados cortes automáticos neste vídeo. A transcrição continua disponível para busca de falas.</p>')+
+      '</section>';
+  }).join("");
+  $("#speechMatches").textContent="Digite uma busca ou consulte o objetivo definido.";
+  $("#speechExport").classList.add("hidden");
+  $("#results").classList.remove("hidden");
+  if(objective){$("#speechQuery").value=objective;runSpeechSearch()}
+}
 $("#analyzeBtn").onclick=async()=>{
-  $("#analyzeBtn").disabled=true;$("#results").classList.add("hidden");progress(1);
+  $("#analyzeBtn").disabled=true;$("#results").classList.add("hidden");$("#batchSources").classList.add("hidden");progress(1);
   try{
-    let data;
-    if(mode==="file"){
-      const f=$("#fileInput").files[0];if(!f)throw new Error("Escolha um vídeo ou áudio.");
-      data=await transcribeFile(f);
-    }else data=await transcribeYoutube();
-    stat("Selecionando os melhores trechos de mensagem...");progress(90);
-    const a=analyze(data);render(a,data);progress(100);stat("Análise concluída.");
-  }catch(e){console.error(e);stat((e&&e.message)?e.message:"Falha no processamento. Tente novamente.",true);progress(0)}
+    const sources=selectedSources(),videos=[],errors=[];
+    const objective=$("#analysisObjective").value.trim();
+    $("#batchSources").classList.remove("hidden");
+    for(let i=0;i<sources.length;i++){
+      const src=sources[i];
+      stat("Analisando material "+(i+1)+" de "+sources.length+": "+src.name);
+      $("#batchSources").textContent="Material "+(i+1)+"/"+sources.length+" — "+src.name;
+      try{
+        const data=src.file?await transcribeFile(src.file):await transcribeYoutube(src.url);
+        if(!(data?.chunks||[]).length)throw new Error("Transcrição vazia.");
+        videos.push({name:src.name,url:src.url,data});
+      }catch(e){
+        console.error("Falha no material",src.name,e);
+        errors.push(src.name+": "+(e.message||"erro desconhecido"));
+      }
+    }
+    if(!videos.length)throw new Error("Nenhum dos materiais foi transcrito. "+errors.join(" | "));
+    renderBatch(videos,errors);
+    progress(100);
+    stat("Concluído: "+videos.length+" de "+sources.length+" materiais. "+(errors.length?"Falhas: "+errors.join(" | "):"")+(objective?" Busca do objetivo aplicada.":""));
+  }catch(e){console.error(e);stat(e.message||"Falha no processamento.",true);progress(0)}
   finally{$("#analyzeBtn").disabled=false}
 };
 
@@ -399,42 +458,42 @@ function speechMatchScore(text,query,interest){
  return score;
 }
 function findSpeech(query){
- const chunks=(lastTranscript?.chunks||[]).filter(c=>c.text&&Number.isFinite(Number(c.start))&&Number.isFinite(Number(c.end)));
  const intent=speechIntent(query),hits=[];
- for(let i=0;i<chunks.length;i++){
-   // Janela de contexto curta para capturar frases partidas entre segmentos.
-   for(const radius of [0,1,2]){
-     const lo=Math.max(0,i-radius),hi=Math.min(chunks.length-1,i+radius);
-     const group=chunks.slice(lo,hi+1);
-     if(group[group.length-1].end-group[0].start>90)continue;
-     const text=group.map(c=>c.text).join(" ").replace(/\s+/g," ").trim();
-     const score=speechMatchScore(text,query,intent);
-     if(score>0)hits.push({start:Number(group[0].start),end:Number(group[group.length-1].end),text,score});
+ for(let sourceIndex=0;sourceIndex<lastVideos.length;sourceIndex++){
+   const source=lastVideos[sourceIndex];
+   const chunks=(source.data.chunks||[]).filter(c=>c.text&&Number.isFinite(Number(c.start))&&Number.isFinite(Number(c.end)));
+   for(let i=0;i<chunks.length;i++){
+     for(const radius of [0,1,2]){
+       const lo=Math.max(0,i-radius),hi=Math.min(chunks.length-1,i+radius),group=chunks.slice(lo,hi+1);
+       if(group[group.length-1].end-group[0].start>90)continue;
+       const text=group.map(c=>c.text).join(" ").replace(/\s+/g," ").trim();
+       const score=speechMatchScore(text,query,intent);
+       if(score>0)hits.push({start:Number(group[0].start),end:Number(group[group.length-1].end),text,score,sourceIndex,sourceName:source.name,url:source.url});
+     }
    }
  }
- hits.sort((a,b)=>b.score-a.score||a.start-b.start);
+ hits.sort((a,b)=>b.score-a.score||a.sourceIndex-b.sourceIndex||a.start-b.start);
  const unique=[];
  for(const h of hits){
-   if(unique.some(u=>Math.abs(u.start-h.start)<12))continue;
-   unique.push(h);
-   if(unique.length>=25)break;
+   if(unique.some(u=>u.sourceIndex===h.sourceIndex&&Math.abs(u.start-h.start)<12))continue;
+   unique.push(h);if(unique.length>=50)break;
  }
- return unique.sort((a,b)=>b.score-a.score);
+ return unique;
 }
-function speechYoutubeUrl(sec){
- if(mode!=="youtube")return"";
- try{const url=new URL($("#youtubeUrl").value.trim());if(!["youtube.com","www.youtube.com","youtu.be","m.youtube.com"].includes(url.hostname))return"";url.searchParams.set("t",String(Math.floor(sec))+"s");return url.href}catch{return""}
+function speechYoutubeUrl(sec,sourceUrl){
+ if(!sourceUrl)return"";
+ try{const url=new URL(sourceUrl);if(!["youtube.com","www.youtube.com","youtu.be","m.youtube.com"].includes(url.hostname))return"";url.searchParams.set("t",String(Math.floor(sec))+"s");return url.href}catch{return""}
 }
 function runSpeechSearch(){
  const query=$("#speechQuery").value.trim(),out=$("#speechMatches");
- if(!lastTranscript){out.textContent="Analise um vídeo primeiro.";return}
+ if(!lastVideos.length){out.textContent="Analise os materiais primeiro.";return}
  if(query.length<2){out.textContent="Digite uma palavra ou pergunta para pesquisar.";return}
  lastSpeechMatches=findSpeech(query);
  $("#speechExport").classList.toggle("hidden",!lastSpeechMatches.length);
  if(!lastSpeechMatches.length){out.textContent="Nenhuma fala correspondente foi encontrada na transcrição. Isso não confirma que o assunto não foi dito: revise a transcrição ou tente outras palavras.";return}
  out.innerHTML='<p class="speechNotice">'+lastSpeechMatches.length+' trecho(s) candidato(s). Tempos aproximados aos segmentos de transcrição; confirme a fala no vídeo original.</p>'+
- lastSpeechMatches.map((m,i)=>'<article class="speechHit"><div class="speechHitHead"><strong>'+esc(time(m.start))+' → '+esc(time(m.end))+'</strong><span>Ocorrência '+(i+1)+'</span></div><p>'+esc(m.text)+'</p><div class="speechHitActions"><button type="button" class="secondary" data-copy-speech="'+i+'">COPIAR TRECHO</button>'+
- (speechYoutubeUrl(m.start)?'<a href="'+esc(speechYoutubeUrl(m.start))+'" target="_blank" rel="noopener noreferrer">ABRIR NO YOUTUBE ↗</a>':'')+'</div></article>').join("");
+ lastSpeechMatches.map((m,i)=>'<article class="speechHit"><div class="speechHitHead"><strong>'+esc(m.sourceName)+' · '+esc(time(m.start))+' → '+esc(time(m.end))+'</strong><span>Ocorrência '+(i+1)+'</span></div><p>'+esc(m.text)+'</p><div class="speechHitActions"><button type="button" class="secondary" data-copy-speech="'+i+'">COPIAR TRECHO</button>'+
+ (speechYoutubeUrl(m.start,m.url)?'<a href="'+esc(speechYoutubeUrl(m.start,m.url))+'" target="_blank" rel="noopener noreferrer">ABRIR NO YOUTUBE ↗</a>':'')+'</div></article>').join("");
 }
 $("#speechFind").addEventListener("click",runSpeechSearch);
 $("#speechQuery").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();runSpeechSearch()}});
@@ -442,10 +501,10 @@ document.querySelectorAll("[data-search]").forEach(b=>b.addEventListener("click"
 $("#speechMatches").addEventListener("click",async e=>{
  const btn=e.target.closest("[data-copy-speech]");if(!btn)return;
  const m=lastSpeechMatches[Number(btn.dataset.copySpeech)];if(!m)return;
- await navigator.clipboard.writeText(time(m.start)+" → "+time(m.end)+"\n"+m.text);stat("Trecho copiado.");
+ await navigator.clipboard.writeText(m.sourceName+" | "+time(m.start)+" → "+time(m.end)+"\n"+m.text);stat("Trecho copiado.");
 });
 $("#speechExport").addEventListener("click",()=>{
- const rows=[["Início","Fim","Texto transcrito"],...lastSpeechMatches.map(m=>[time(m.start),time(m.end),m.text])];
+ const rows=[["Vídeo","Início","Fim","Texto transcrito"],...lastSpeechMatches.map(m=>[m.sourceName,time(m.start),time(m.end),m.text])];
  const csv="\ufeff"+rows.map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(";")).join("\r\n");
  const url=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
  const a=document.createElement("a");a.href=url;a.download="aurum-busca-falas.csv";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
