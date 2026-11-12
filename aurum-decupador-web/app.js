@@ -1,5 +1,5 @@
 const API="https://aurum-decupador-engine.onrender.com";
-let mode="file",lastText="",lastAnalysis=null,engineReady=false;
+let mode="file",lastText="",lastAnalysis=null,engineReady=false,lastTranscript=null,lastSpeechMatches=[];
 const $=s=>document.querySelector(s);
 
 function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
@@ -327,6 +327,7 @@ function analyze(data){
 
 function title(t){const s=t.split(/[.!?]/)[0].trim().split(/\s+/).slice(0,12).join(" ");return s+(t.split(/\s+/).length>12?"...":"")}
 function render(a,data){
+  lastTranscript=data;lastSpeechMatches=[];$("#speechMatches").textContent="Digite um termo ou escolha uma busca rápida.";$("#speechExport").classList.add("hidden");
   $("#summary").textContent=a.summary;
   $("#subjects").innerHTML=a.subjects.map(s=>`<span class="chip">${esc(s)}</span>`).join("");
   $("#cutsTitle").textContent=`${a.cuts.length} cortes encontrados`;
@@ -359,3 +360,93 @@ $("#analyzeBtn").onclick=async()=>{
   }catch(e){console.error(e);stat((e&&e.message)?e.message:"Falha no processamento. Tente novamente.",true);progress(0)}
   finally{$("#analyzeBtn").disabled=false}
 };
+
+/* Pesquisa contextual conservadora: sempre devolve a fala transcrita, nunca inventa resposta. */
+const speechAliases={
+  domingo:["domingo","domingos","dominical"],
+  reuniao:["reuniao","reunioes","culto","cultos","encontro","concentracao","campanha"],
+  horario:["horario","hora","horas","h","manha","tarde","noite","meio-dia"],
+  tema:["tema","proposito","nome","chamada","domingo","campanha","especial"],
+  local:["local","endereco","avenida","rua","praca","templo","igreja","cidade","bairro","sede"],
+  apostolo:["apostolo","valdemiro","pregador"],
+  ceia:["ceia","santa ceia"],
+  imposicao:["imposicao","maos","oracao"]
+};
+function normSpeech(s){return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").toLowerCase()}
+function speechTokens(s){return normSpeech(s).match(/[a-z0-9]+/g)||[]}
+function speechIntent(query){
+ const q=new Set(speechTokens(query)),intent=new Set();
+ for(const [key,aliases] of Object.entries(speechAliases))if(aliases.some(a=>q.has(a)))intent.add(key);
+ return intent;
+}
+function speechMatchScore(text,query,interest){
+ const words=new Set(speechTokens(text)),qwords=[...new Set(speechTokens(query).filter(w=>w.length>2&&!stop.has(w)))];
+ if(!qwords.length)return 0;
+ let matched=0;
+ for(const word of qwords){if(words.has(word))matched++}
+ let aliasHit=0;
+ for(const intent of interest){
+  if((speechAliases[intent]||[]).some(a=>words.has(a)))aliasHit++;
+ }
+ // Requer ao menos um termo pesquisado ou equivalente contextual; evita resultados fabricados.
+ if(!matched&&!aliasHit)return 0;
+ let score=matched*3+aliasHit*2;
+ const raw=normSpeech(text);
+ if(interest.has("horario")&&(/\b(?:[0-2]?\d)\s*(?:h|horas?|:|e\s+meia)\b/.test(raw)||/\b(?:manha|tarde|noite|meio.dia)\b/.test(raw)))score+=5;
+ if(interest.has("domingo")&&/\b(?:neste|proximo|esse|agora)\s+domingo\b|\bdomingo\s+(?:agora|que vem)\b/.test(raw))score+=5;
+ if(interest.has("tema")&&/\b(?:tema|proposito|chamado|vai ser|sera|nome|domingo da|domingo do)\b/.test(raw))score+=3;
+ if(interest.has("local")&&/\b(?:avenida|rua|cidade|bairro|templo|sede|endereco|local)\b/.test(raw))score+=3;
+ return score;
+}
+function findSpeech(query){
+ const chunks=(lastTranscript?.chunks||[]).filter(c=>c.text&&Number.isFinite(Number(c.start))&&Number.isFinite(Number(c.end)));
+ const intent=speechIntent(query),hits=[];
+ for(let i=0;i<chunks.length;i++){
+   // Janela de contexto curta para capturar frases partidas entre segmentos.
+   for(const radius of [0,1,2]){
+     const lo=Math.max(0,i-radius),hi=Math.min(chunks.length-1,i+radius);
+     const group=chunks.slice(lo,hi+1);
+     if(group[group.length-1].end-group[0].start>90)continue;
+     const text=group.map(c=>c.text).join(" ").replace(/\s+/g," ").trim();
+     const score=speechMatchScore(text,query,intent);
+     if(score>0)hits.push({start:Number(group[0].start),end:Number(group[group.length-1].end),text,score});
+   }
+ }
+ hits.sort((a,b)=>b.score-a.score||a.start-b.start);
+ const unique=[];
+ for(const h of hits){
+   if(unique.some(u=>Math.abs(u.start-h.start)<12))continue;
+   unique.push(h);
+   if(unique.length>=25)break;
+ }
+ return unique.sort((a,b)=>b.score-a.score);
+}
+function speechYoutubeUrl(sec){
+ if(mode!=="youtube")return"";
+ try{const url=new URL($("#youtubeUrl").value.trim());if(!["youtube.com","www.youtube.com","youtu.be","m.youtube.com"].includes(url.hostname))return"";url.searchParams.set("t",String(Math.floor(sec))+"s");return url.href}catch{return""}
+}
+function runSpeechSearch(){
+ const query=$("#speechQuery").value.trim(),out=$("#speechMatches");
+ if(!lastTranscript){out.textContent="Analise um vídeo primeiro.";return}
+ if(query.length<2){out.textContent="Digite uma palavra ou pergunta para pesquisar.";return}
+ lastSpeechMatches=findSpeech(query);
+ $("#speechExport").classList.toggle("hidden",!lastSpeechMatches.length);
+ if(!lastSpeechMatches.length){out.textContent="Nenhuma fala correspondente foi encontrada na transcrição. Isso não confirma que o assunto não foi dito: revise a transcrição ou tente outras palavras.";return}
+ out.innerHTML='<p class="speechNotice">'+lastSpeechMatches.length+' trecho(s) candidato(s). Tempos aproximados aos segmentos de transcrição; confirme a fala no vídeo original.</p>'+
+ lastSpeechMatches.map((m,i)=>'<article class="speechHit"><div class="speechHitHead"><strong>'+esc(time(m.start))+' → '+esc(time(m.end))+'</strong><span>Ocorrência '+(i+1)+'</span></div><p>'+esc(m.text)+'</p><div class="speechHitActions"><button type="button" class="secondary" data-copy-speech="'+i+'">COPIAR TRECHO</button>'+
+ (speechYoutubeUrl(m.start)?'<a href="'+esc(speechYoutubeUrl(m.start))+'" target="_blank" rel="noopener noreferrer">ABRIR NO YOUTUBE ↗</a>':'')+'</div></article>').join("");
+}
+$("#speechFind").addEventListener("click",runSpeechSearch);
+$("#speechQuery").addEventListener("keydown",e=>{if(e.key==="Enter"){e.preventDefault();runSpeechSearch()}});
+document.querySelectorAll("[data-search]").forEach(b=>b.addEventListener("click",()=>{$("#speechQuery").value=b.dataset.search;runSpeechSearch()}));
+$("#speechMatches").addEventListener("click",async e=>{
+ const btn=e.target.closest("[data-copy-speech]");if(!btn)return;
+ const m=lastSpeechMatches[Number(btn.dataset.copySpeech)];if(!m)return;
+ await navigator.clipboard.writeText(time(m.start)+" → "+time(m.end)+"\n"+m.text);stat("Trecho copiado.");
+});
+$("#speechExport").addEventListener("click",()=>{
+ const rows=[["Início","Fim","Texto transcrito"],...lastSpeechMatches.map(m=>[time(m.start),time(m.end),m.text])];
+ const csv="\ufeff"+rows.map(row=>row.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(";")).join("\r\n");
+ const url=URL.createObjectURL(new Blob([csv],{type:"text/csv;charset=utf-8"}));
+ const a=document.createElement("a");a.href=url;a.download="aurum-busca-falas.csv";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+});
